@@ -6,6 +6,11 @@ import math
 # Initialization
 # -------------------
 pygame.init()
+try:
+    pygame.mixer.init()
+    music_available = True
+except pygame.error:
+    music_available = False
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 clock = pygame.time.Clock()
@@ -1221,122 +1226,261 @@ PLATFORM_DATA = [
     }
 ]
 
+# --- Auto-load generated platform data if available ---
+import json as _json, os as _os
+_gen = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'platforms_generated.json')
+if _os.path.exists(_gen):
+    with open(_gen) as _f:
+        PLATFORM_DATA = _json.load(_f)
+# --- End auto-load ---
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
+PLAYER_W = 50
+PLAYER_H = 50
+
 player_frames = []
 for f in ["frame1.png", "frame2.png", "frame3.png", "jump.png"]:
-    player_frames.append(pygame.image.load(os.path.join(ASSETS_DIR, f)).convert_alpha())
+    img = pygame.image.load(os.path.join(ASSETS_DIR, f)).convert_alpha()
+    player_frames.append(pygame.transform.scale(img, (PLAYER_W, PLAYER_H)))
 
-pygame.mixer.music.load(os.path.join(ASSETS_DIR, "wait for you.mp3"))
+if music_available:
+    try:
+        pygame.mixer.music.load(os.path.join(ASSETS_DIR, "wait for you.mp3"))
+    except pygame.error:
+        music_available = False
 
 # -------------------
 # Constants
 # -------------------
-SCROLL_SPEED = 12
-PLAYER_X = 150
-PLATFORM_Y = 450
-JUMP_DURATION = 0.6  # Seconds the jump lasts
-MAX_JUMP_HEIGHT = 180
-FALL_SPEED = 15
+SCROLL_SPEED      = 12
+PLAYER_X          = 150
+PLATFORM_H        = 40
+FALL_SPEED        = 14
+MAX_ARC           = 170       # max pixel overshoot on a full-length jump
+STEP_THRESHOLD    = 0.25      # seconds: gap <= this => smooth step, no arc
+INTRO_WALK_DUR    = 3.0       # seconds of walking before music starts
+DATA_Y_GROUND     = 340       # lowest data-y
+SCREEN_GROUND     = 450       # where data_y=340 maps on screen
+
+font_ui    = pygame.font.SysFont(None, 46)
+font_small = pygame.font.SysFont(None, 30)
 
 # -------------------
-# Variables
+# Helper: coordinate mapping
 # -------------------
-player_rect = pygame.Rect(PLAYER_X, PLATFORM_Y - 128, 128, 128)
-game_started = False
-player_state = "RUNNING" # Options: "RUNNING", "JUMPING", "FALLING"
-jump_start_time = 0
-music_time = 0
+def dsy(data_y):
+    """Convert platform data-y to screen-y."""
+    return data_y + (SCREEN_GROUND - DATA_Y_GROUND)
+
+# -------------------
+# Build sorted platform sequence
+# -------------------
+PLATFORMS = sorted(PLATFORM_DATA, key=lambda p: p['start'])
+
+# -------------------
+# Helper functions
+# -------------------
+def clamp01(v):
+    return max(0.0, min(1.0, v))
+
+def ease_inout(t):
+    return t * t * (3.0 - 2.0 * t)
+
+def find_next(current_idx):
+    """Return (idx, platform) immediately after current_idx."""
+    nxt = current_idx + 1
+    if nxt < len(PLATFORMS):
+        return nxt, PLATFORMS[nxt]
+    return None, None
+
+def compute_fly_y(t, t0, t1, y0, y1, do_arc):
+    """Interpolate character screen-y during a flight segment."""
+    if t1 <= t0:
+        return y1
+    p = clamp01((t - t0) / (t1 - t0))
+    if do_arc:
+        base = y0 + (y1 - y0) * p
+        duration = t1 - t0
+        arc_h = clamp01(duration / 0.8) * MAX_ARC
+        arc_h = max(arc_h, 40)
+        return base - arc_h * math.sin(math.pi * p)
+    else:
+        return y0 + (y1 - y0) * ease_inout(p)
+
+# -------------------
+# Game states
+# -------------------
+S_IDLE    = "IDLE"       # waiting at start
+S_WALK    = "WALKING"    # held space, intro walk
+S_FLY     = "AIRBORNE"   # jump or smooth step
+S_RUN     = "ON_PLATFORM"
+S_FALL    = "FALLING"
+
+# -------------------
+# State variables
+# -------------------
+state          = S_IDLE
+music_started  = False
+music_time     = -INTRO_WALK_DUR   # negative = pre-music, 0+ = in song
+
+first_plat_y   = dsy(PLATFORMS[0]['y'])
+cur_plat_idx   = -1                # -1 = on intro platform
+cur_plat_y     = first_plat_y      # screen-y of top of current platform
+
+fly_t0 = fly_t1 = 0.0
+fly_y0 = fly_y1 = 0.0
+fly_arc = False
+
+player_rect = pygame.Rect(PLAYER_X, int(cur_plat_y) - PLAYER_H, PLAYER_W, PLAYER_H)
 
 # -------------------
 # Main Loop
 # -------------------
 running = True
 while running:
-    if game_started:
-        music_time = (pygame.mixer.music.get_pos() / 1000.0)
-    
-    screen.fill((20, 20, 35))
-    keys = pygame.key.get_pressed()
-    is_holding_space = keys[pygame.K_SPACE]
+    dt = clock.tick(60) / 1000.0
 
+    # --- advance music time ---
+    if music_started:
+        if music_available:
+            music_time = pygame.mixer.music.get_pos() / 1000.0
+        else:
+            music_time += dt
+    elif state == S_WALK:
+        music_time += dt  # walks from -INTRO_WALK_DUR toward 0
+
+    screen.fill((20, 20, 35))
+
+    # --- events ---
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        
-        # RELEASE SPACE TO JUMP
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+            if state == S_IDLE:
+                state      = S_WALK
+                music_time = -INTRO_WALK_DUR
+
         if event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
-            if not game_started:
-                game_started = True
-                pygame.mixer.music.play()
-                
-            if player_state == "RUNNING":
-                player_state = "JUMPING"
-                jump_start_time = music_time
 
-    # --- PLATFORM TRACKING ---
-    currently_over_platform = False
-    
-    # Intro Platform
-    intro_x = (0 * 60 * SCROLL_SPEED) - (music_time * 60 * SCROLL_SPEED) + PLAYER_X
-    intro_rect = pygame.Rect(intro_x, PLATFORM_Y, 2.5 * 60 * SCROLL_SPEED, 40)
-    if intro_rect.right > 0:
-        pygame.draw.rect(screen, (50, 50, 70), intro_rect)
-        if intro_rect.collidepoint(PLAYER_X + 64, PLATFORM_Y + 5):
-            currently_over_platform = True
+            if state == S_WALK:
+                # --- tutorial jump: release space -> start music, fly to first platform ---
+                music_started = True
+                music_time    = 0.0
+                if music_available:
+                    pygame.mixer.music.play()
 
-    # Beat Platforms
-    for p in PLATFORM_DATA:
-        x_pos = (p['start'] * 60 * SCROLL_SPEED) - (music_time * 60 * SCROLL_SPEED) + PLAYER_X
-        width = (p['end'] - p['start']) * 60 * SCROLL_SPEED
-        plat_rect = pygame.Rect(x_pos, PLATFORM_Y, width, 40)
-        if -width < x_pos < WIDTH:
-            pygame.draw.rect(screen, (100, 100, 255), plat_rect)
-            if plat_rect.collidepoint(PLAYER_X + 64, PLATFORM_Y + 5):
-                currently_over_platform = True
+                p0      = PLATFORMS[0]
+                fly_t0  = 0.0
+                fly_t1  = p0['start']
+                fly_y0  = cur_plat_y
+                fly_y1  = dsy(p0['y'])
+                gap     = fly_t1 - fly_t0
+                fly_arc = gap >= STEP_THRESHOLD
 
-    # --- PHYSICS STATE MACHINE ---
-    if game_started:
-        if player_state == "RUNNING":
-            player_rect.bottom = PLATFORM_Y
-            # If the platform ends or we let go of space without jumping, we fall
-            if not currently_over_platform:
-                player_state = "FALLING"
+                cur_plat_idx = 0
+                state        = S_FLY
 
-        elif player_state == "JUMPING":
-            t = (music_time - jump_start_time) / JUMP_DURATION
-            if t <= 1.0:
-                # Parabolic Arc
-                arc = 4 * MAX_JUMP_HEIGHT * t * (1 - t)
-                player_rect.bottom = PLATFORM_Y - arc
-                
-                # SNAP MID-AIR: If we press space while falling in the arc
-                if t > 0.5 and is_holding_space and currently_over_platform:
-                    player_state = "RUNNING"
+            elif state == S_RUN:
+                # --- find next platform and decide jump vs step ---
+                next_idx, next_p = find_next(cur_plat_idx)
+                if next_p is not None:
+                    t_now  = music_time
+                    t_land = next_p['start']
+                    gap    = max(0.0, t_land - t_now)
+
+                    fly_t0  = t_now
+                    fly_t1  = t_now + gap
+                    fly_y0  = cur_plat_y
+                    fly_y1  = dsy(next_p['y'])
+                    fly_arc = gap >= STEP_THRESHOLD
+
+                    cur_plat_idx = next_idx
+                    state        = S_FLY
+                else:
+                    state = S_FALL
+
+    # --- state machine update ---
+    if state == S_FLY:
+        if music_time >= fly_t1:
+            # landed
+            cur_plat_y    = fly_y1
+            player_rect.y = int(cur_plat_y) - PLAYER_H
+
+            p = PLATFORMS[cur_plat_idx]
+            if music_time <= p['end'] + 0.1:
+                state = S_RUN
             else:
-                player_state = "FALLING"
+                state = S_FALL
+        else:
+            char_y        = compute_fly_y(music_time, fly_t0, fly_t1,
+                                          fly_y0, fly_y1, fly_arc)
+            player_rect.y = int(char_y) - PLAYER_H
 
-        elif player_state == "FALLING":
-            player_rect.y += FALL_SPEED
-            # CATCH: If we press space while passing a platform
-            if is_holding_space and currently_over_platform:
-                if player_rect.bottom >= PLATFORM_Y - 20: # Buffer to prevent teleporting from way above
-                    player_state = "RUNNING"
+    elif state == S_RUN:
+        player_rect.y = int(cur_plat_y) - PLAYER_H
+        p = PLATFORMS[cur_plat_idx]
+        if music_time > p['end'] + 0.08:
+            state = S_FALL
 
-    # --- RESET ---
-    if player_rect.top > HEIGHT:
-        pygame.mixer.music.stop()
-        game_started = False
-        player_rect.bottom = PLATFORM_Y
-        player_state = "RUNNING"
-        music_time = 0
+    elif state in (S_IDLE, S_WALK):
+        player_rect.y = int(cur_plat_y) - PLAYER_H
 
-    # --- DRAW ---
-    frame = (int(pygame.time.get_ticks() / 100) % 3) if player_state == "RUNNING" else 3
+    elif state == S_FALL:
+        player_rect.y += int(FALL_SPEED)
+        if player_rect.top > HEIGHT:
+            if music_started and music_available:
+                pygame.mixer.music.stop()
+            music_started  = False
+            music_time     = -INTRO_WALK_DUR
+            state          = S_IDLE
+            cur_plat_idx   = -1
+            cur_plat_y     = first_plat_y
+            player_rect.y  = int(cur_plat_y) - PLAYER_H
+
+    # --- draw intro platform ---
+    # extends from 5 sec before first platform up to its start
+    intro_end   = PLATFORMS[0]['start']
+    intro_start = intro_end - 5.0
+    ix = (intro_start * 60 * SCROLL_SPEED) - (music_time * 60 * SCROLL_SPEED) + PLAYER_X
+    iw = (intro_end - intro_start) * 60 * SCROLL_SPEED
+    isy = first_plat_y
+    if ix + iw > 0:
+        pygame.draw.rect(screen, (55, 55, 90), (int(ix), int(isy), int(iw), PLATFORM_H))
+
+    # --- draw beat platforms (multi-height) ---
+    for p in PLATFORMS:
+        xp = (p['start'] * 60 * SCROLL_SPEED) - (music_time * 60 * SCROLL_SPEED) + PLAYER_X
+        wp = (p['end'] - p['start']) * 60 * SCROLL_SPEED
+        sy = dsy(p['y'])
+        if -wp < xp < WIDTH:
+            col = (120, 120, 255)
+            pygame.draw.rect(screen, col, (int(xp), int(sy), int(wp), PLATFORM_H))
+
+    # --- draw player ---
+    run_frame = int(pygame.time.get_ticks() / 100) % 3
+    if state == S_FLY and fly_arc:
+        frame = 3
+    elif state == S_FALL:
+        frame = 3
+    elif state == S_IDLE:
+        frame = 0
+    else:
+        frame = run_frame
     screen.blit(player_frames[frame], (player_rect.x, player_rect.y))
-    
+
+    # --- UI instructions ---
+    if state == S_IDLE:
+        txt = font_ui.render("Hold [SPACE] to start walking", True, (255, 255, 255))
+        screen.blit(txt, txt.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+    elif state == S_WALK:
+        txt = font_ui.render("Release [SPACE] to jump!", True, (255, 215, 60))
+        screen.blit(txt, txt.get_rect(center=(WIDTH // 2, 70)))
+        hint = font_small.render("Land on the first platform to begin", True, (180, 180, 220))
+        screen.blit(hint, hint.get_rect(center=(WIDTH // 2, 110)))
+
     pygame.display.update()
-    clock.tick(60)
 
 pygame.quit()
